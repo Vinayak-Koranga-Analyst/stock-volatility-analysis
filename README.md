@@ -17,6 +17,7 @@ pip install -r requirements.txt
 python fetch_data.py
 python analysis.py
 python plot_volatility.py
+python correlation_heatmap.py
 ```
 
 `fetch_data.py` writes to `data/stocks.duckdb`, table `stock_prices`:
@@ -36,6 +37,12 @@ duplicating rows. FTSE 100 constituents are scraped live from Wikipedia on
 each run (with a fixed fallback list if that fails), so the ticker universe
 always reflects current index membership. Rows with a null close (unsettled
 data at fetch time) are dropped before loading.
+
+`fetch_data.py` also writes table `ticker_sectors` (`ticker`, `sector`),
+scraping each FTSE 100 ticker's ICB sector from the same Wikipedia page
+(casing variants like "Financial services"/"Financial Services" are
+normalized to one label) and tagging the 5 US tech stocks `"Technology"`.
+This table is fully replaced on each run.
 
 `analysis.py` reads `stock_prices` and writes table `stock_metrics`, one row
 per ticker per date:
@@ -63,4 +70,14 @@ duckdb data/stocks.duckdb -c "SELECT * FROM stock_metrics ORDER BY volatility_30
 `plot_volatility.py` reads `stock_metrics` and saves a bar chart of the top
 tickers (default 10) by most recent 30-day annualized volatility to
 `plots/volatility.png`. Use `--top` and `--out` to change the count or
+output path.
+
+`correlation_heatmap.py` reads `stock_metrics` daily returns joined to
+`ticker_sectors` and saves a correlation heatmap comparing three groups —
+Energy, Financials, Technology — to `plots/correlation_heatmap.png`.
+Representative tickers per group are the top N (default 8, or fewer if a
+group has fewer members) by average daily volume. The FTSE 100 has only 2
+constituents classified as pure "Oil & gas producers" (BP.L, SHEL.L), so
+Energy is limited to those 2 rather than padded out with Utilities, which
+is a distinct ICB sector. Use `--top` and `--out` to change the count or
 output path.

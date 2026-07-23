@@ -1,6 +1,8 @@
 """
 Pull 2 years of daily OHLCV price history for the FTSE 100 constituents plus a
-fixed set of US tech stocks, and load it into a DuckDB database.
+fixed set of US tech stocks, and load it into a DuckDB database. Also scrapes
+each FTSE 100 ticker's ICB sector (and tags the US tech stocks "Technology")
+into a ticker_sectors table.
 
 Usage:
     python fetch_data.py [--period 2y] [--db data/stocks.duckdb]
@@ -21,6 +23,7 @@ log = logging.getLogger(__name__)
 DEFAULT_DB_PATH = Path(__file__).parent / "data" / "stocks.duckdb"
 DEFAULT_PERIOD = "2y"
 TABLE_NAME = "stock_prices"
+SECTOR_TABLE_NAME = "ticker_sectors"
 
 US_TECH_TICKERS = {
     "AAPL": "Apple",
@@ -47,34 +50,58 @@ FTSE100_FALLBACK = [
 
 WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/FTSE_100_Index"
 
+# The Wikipedia table's sector column isn't consistently cased across rows
+# (e.g. "Financial services" vs "Financial Services"); collapse known
+# casing variants of the same ICB sector onto one canonical label.
+SECTOR_NORMALIZATION = {
+    "financial services": "Financial Services",
+    "investment trusts": "Investment Trusts",
+    "real estate investment trusts": "Real Estate Investment Trusts",
+    "software & computer services": "Software & Computer Services",
+}
+
 
 def epic_to_yahoo_ticker(epic: str) -> str:
     """Convert a raw LSE EPIC code (e.g. 'BT.A') to Yahoo Finance format ('BT-A.L')."""
     return epic.strip().replace(".", "-") + ".L"
 
 
-def fetch_ftse100_tickers() -> dict:
-    """Scrape current FTSE 100 constituents from Wikipedia. Falls back to a
-    fixed snapshot if the page can't be reached or its layout has changed."""
+def normalize_sector(raw: str) -> str:
+    cleaned = raw.strip()
+    return SECTOR_NORMALIZATION.get(cleaned.lower(), cleaned)
+
+
+def fetch_ftse100_constituents() -> pd.DataFrame:
+    """Scrape current FTSE 100 constituents (ticker, company, ICB sector) from
+    Wikipedia. Falls back to a fixed ticker snapshot (sector 'Unknown') if the
+    page can't be reached or its layout has changed."""
     try:
         tables = pd.read_html(WIKIPEDIA_URL, storage_options={"User-Agent": "Mozilla/5.0"})
         constituents = next(t for t in tables if {"Company", "Ticker"}.issubset(t.columns))
-        tickers = {
-            epic_to_yahoo_ticker(row["Ticker"]): row["Company"]
-            for _, row in constituents.iterrows()
-        }
-        log.info("Fetched %d FTSE 100 tickers from Wikipedia", len(tickers))
-        return tickers
+        sector_col = next(c for c in constituents.columns if c not in ("Company", "Ticker"))
+        df = pd.DataFrame({
+            "ticker": constituents["Ticker"].map(epic_to_yahoo_ticker),
+            "company": constituents["Company"],
+            "sector": constituents[sector_col].map(normalize_sector),
+        })
+        log.info("Fetched %d FTSE 100 constituents from Wikipedia", len(df))
+        return df
     except Exception as exc:
-        log.warning("Wikipedia scrape failed (%s); using fallback ticker list", exc)
-        return {epic_to_yahoo_ticker(e): e for e in FTSE100_FALLBACK}
+        log.warning("Wikipedia scrape failed (%s); using fallback ticker list (sector unavailable)", exc)
+        return pd.DataFrame({
+            "ticker": [epic_to_yahoo_ticker(e) for e in FTSE100_FALLBACK],
+            "company": FTSE100_FALLBACK,
+            "sector": "Unknown",
+        })
 
 
-def build_ticker_universe() -> dict:
-    """Return a dict mapping Yahoo Finance ticker -> company name."""
-    universe = fetch_ftse100_tickers()
-    universe.update(US_TECH_TICKERS)
-    return universe
+def build_universe(constituents: pd.DataFrame) -> tuple:
+    """Return (ticker -> company, ticker -> sector) dicts for FTSE 100 + US tech."""
+    companies = dict(zip(constituents["ticker"], constituents["company"]))
+    sectors = dict(zip(constituents["ticker"], constituents["sector"]))
+    companies.update(US_TECH_TICKERS)
+    sectors.update({t: "Technology" for t in US_TECH_TICKERS})
+    return companies, sectors
 
 
 def download_prices(tickers: list, period: str) -> pd.DataFrame:
@@ -164,21 +191,42 @@ def load_to_duckdb(df: pd.DataFrame, db_path: Path) -> None:
         con.close()
 
 
+def load_sectors_to_duckdb(sectors: dict, db_path: Path) -> None:
+    """Replace ticker_sectors with the current ticker -> sector mapping."""
+    df = pd.DataFrame(sorted(sectors.items()), columns=["ticker", "sector"])
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(db_path))
+    try:
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {SECTOR_TABLE_NAME} (
+                ticker VARCHAR NOT NULL PRIMARY KEY,
+                sector VARCHAR NOT NULL
+            )
+        """)
+        con.register("df_sectors", df)
+        con.execute(f"INSERT INTO {SECTOR_TABLE_NAME} SELECT * FROM df_sectors")
+        log.info("Loaded %d rows into '%s'", len(df), SECTOR_TABLE_NAME)
+    finally:
+        con.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--period", default=DEFAULT_PERIOD, help="yfinance period, e.g. 2y, 1y, 6mo")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="Path to the DuckDB database file")
     args = parser.parse_args()
 
-    universe = build_ticker_universe()
-    log.info("Ticker universe: %d total (FTSE 100 + US tech)", len(universe))
+    constituents = fetch_ftse100_constituents()
+    companies, sectors = build_universe(constituents)
+    log.info("Ticker universe: %d total (FTSE 100 + US tech)", len(companies))
 
-    prices = download_prices(list(universe.keys()), period=args.period)
+    prices = download_prices(list(companies.keys()), period=args.period)
     if prices.empty:
         log.error("No price data downloaded; aborting")
         sys.exit(1)
 
     load_to_duckdb(prices, Path(args.db))
+    load_sectors_to_duckdb(sectors, Path(args.db))
 
 
 if __name__ == "__main__":

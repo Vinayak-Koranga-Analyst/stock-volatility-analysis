@@ -16,6 +16,7 @@ pip install -r requirements.txt
 ```bash
 python fetch_data.py
 python analysis.py
+python plot_volatility.py
 ```
 
 `fetch_data.py` writes to `data/stocks.duckdb`, table `stock_prices`:
@@ -58,3 +59,8 @@ full window (e.g. `ma_200` needs 200 prior rows).
 duckdb data/stocks.duckdb -c "SELECT * FROM stock_prices LIMIT 5;"
 duckdb data/stocks.duckdb -c "SELECT * FROM stock_metrics ORDER BY volatility_30d DESC LIMIT 5;"
 ```
+
+`plot_volatility.py` reads `stock_metrics` and saves a bar chart of the top
+tickers (default 10) by most recent 30-day annualized volatility to
+`plots/volatility.png`. Use `--top` and `--out` to change the count or
+output path.
